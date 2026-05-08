@@ -1,0 +1,600 @@
+package com.registration.app.federatedidsartefact.ui;
+
+import javax.swing.*;
+import javax.swing.table.DefaultTableCellRenderer;
+import javax.swing.table.DefaultTableModel;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
+
+public class MainFrame extends JFrame {
+private record UiProgress(int percent, String label) implements UiEvent {};
+
+    // Keep UI responsive even if user types "3,000,000"
+    private static final int MAX_UI_NODES = 2000;
+
+
+    private static final String READY = "READY";
+    private static final String TRAINING = "TRAINING";
+    private static final String DONE = "DONE";
+    private static final String ERROR = "ERROR";
+
+    private final JTextArea log = new JTextArea();
+    private final JProgressBar progress = new JProgressBar(0, 100);
+
+    private final JTextField clientsField = new JTextField("30");
+    private final JTextField roundsField = new JTextField("15");
+
+    private JButton startBtn;
+    private JButton stopBtn;
+
+    // Nodes table
+    private final DefaultTableModel nodesModel =
+            new DefaultTableModel(new Object[]{"Node", "Status"}, 0) {
+                @Override public boolean isCellEditable(int row, int col) { return false; }
+            };
+    private final JTable nodesTable = new JTable(nodesModel);
+
+    private TrainingWorker worker;
+
+    public MainFrame() {
+        super("Federated IDS Demonstrator (Swing)");
+        setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+        setSize(1100, 700);
+        setLocationRelativeTo(null);
+
+        setLayout(new BorderLayout());
+        add(buildTopControls(), BorderLayout.NORTH);
+        add(buildTabs(), BorderLayout.CENTER);
+        add(buildStatusBar(), BorderLayout.SOUTH);
+
+        log.setEditable(false);
+        log.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+    }
+
+    private JComponent buildTopControls() {
+        JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT));
+
+        startBtn = new JButton("Start");
+        stopBtn = new JButton("Stop");
+        stopBtn.setEnabled(false);
+
+        clientsField.setColumns(10);
+        roundsField.setColumns(6);
+
+        startBtn.addActionListener(e -> startSimulation());
+        stopBtn.addActionListener(e -> stopSimulation());
+
+        p.add(new JLabel("Clients:"));
+        p.add(clientsField);
+
+        p.add(new JLabel("Rounds:"));
+        p.add(roundsField);
+
+        p.add(startBtn);
+        p.add(stopBtn);
+
+        return p;
+    }
+
+    private JComponent buildTabs() {
+        JTabbedPane tabs = new JTabbedPane();
+
+        tabs.addTab("Data", buildPlaceholder("Step 3 in progress: Start/Stop simulation.\nNext we will build CSV chooser + preview."));
+        tabs.addTab("Nodes", buildNodesTab());
+        tabs.addTab("Training Log", new JScrollPane(log));
+        tabs.addTab("Results", buildPlaceholder("Next: plot metrics per round (Accuracy/F1/Drift)."));
+
+        return tabs;
+    }
+
+    private JComponent buildNodesTab() {
+        JPanel root = new JPanel(new BorderLayout(8, 8));
+
+        nodesTable.setFillsViewportHeight(true);
+        nodesTable.getColumnModel().getColumn(1).setCellRenderer(new StatusRenderer());
+
+        JButton apply = new JButton("Apply Clients → Nodes Table");
+        apply.addActionListener(e -> {
+            int requested = parseIntSafe(clientsField.getText(), 30);
+            int shown = clampUiNodes(requested);
+            populateNodes(shown);
+        });
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        top.add(new JLabel("UI shows up to " + MAX_UI_NODES + " nodes to prevent freezing."));
+        top.add(apply);
+
+        root.add(top, BorderLayout.NORTH);
+        root.add(new JScrollPane(nodesTable), BorderLayout.CENTER);
+
+        // initial fill
+        populateNodes(clampUiNodes(parseIntSafe(clientsField.getText(), 30)));
+
+        return root;
+    }
+
+    private JComponent buildStatusBar() {
+        JPanel p = new JPanel(new BorderLayout());
+        progress.setStringPainted(true);
+        progress.setValue(0);
+        progress.setString("Idle");
+        p.add(progress, BorderLayout.CENTER);
+        return p;
+    }
+
+    private JComponent buildPlaceholder(String msg) {
+        JTextArea a = new JTextArea(msg);
+        a.setEditable(false);
+        a.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+        a.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
+        return new JScrollPane(a);
+    }
+
+    private void startSimulation() {
+        if (worker != null && !worker.isDone()) {
+            append("[WARN] Already running.\n");
+            return;
+        }
+
+        int requestedClients = parseIntSafe(clientsField.getText(), 30);
+        int shownClients = clampUiNodes(requestedClients);
+        int rounds = Math.max(1, parseIntSafe(roundsField.getText(), 15));
+
+        populateNodes(shownClients);
+
+        append("[INFO] Starting simulation...\n");
+        append("[INFO] Requested clients: " + requestedClients + "\n");
+        if (requestedClients != shownClients) {
+            append("[WARN] UI is displaying " + shownClients + " clients (capped to stay responsive).\n");
+        }
+        append("[INFO] Rounds: " + rounds + "\n");
+
+        startBtn.setEnabled(false);
+        stopBtn.setEnabled(true);
+        progress.setValue(0);
+        progress.setString("Running...");
+
+        worker = new TrainingWorker(shownClients, rounds);
+        worker.execute();
+    }
+
+    private void stopSimulation() {
+        if (worker != null && !worker.isDone()) {
+            worker.cancel(true);
+            append("[INFO] Stop requested.\n");
+        }
+    }
+
+    private void populateNodes(int n) {
+        nodesModel.setRowCount(0);
+        for (int i = 1; i <= n; i++) {
+            nodesModel.addRow(new Object[]{"Client-" + i, READY});
+        }
+    }
+
+    private void setNodeStatus(int rowIndex, String status) {
+        // column 1 is "Status"
+        if (rowIndex >= 0 && rowIndex < nodesModel.getRowCount()) {
+            nodesModel.setValueAt(status, rowIndex, 1);
+        }
+    }
+
+    private int clampUiNodes(int requested) {
+        if (requested > MAX_UI_NODES) return MAX_UI_NODES;
+        return Math.max(1, requested);
+    }
+
+    private void append(String s) {
+        log.append(s);
+        log.setCaretPosition(log.getDocument().getLength());
+    }
+
+    private static int parseIntSafe(String s, int fallback) {
+        try { return Integer.parseInt(s.trim().replace(",", "")); }
+        catch (Exception ex) { return fallback; }
+    }
+
+    // Events from background worker to UI thread
+    private sealed interface UiEvent permits UiLog, UiStatus, UiProgress {}
+    private record UiLog(String msg) implements UiEvent {}
+    private record UiStatus(int row, String status) implements UiEvent {}
+    private record UiProgress(int percent, String label) implements UiEvent {}
+
+    private final class TrainingWorker extends SwingWorker<Void, UiEvent> {
+        private final int clients;
+        private final int rounds;
+        private final Random rnd = new Random();
+
+        TrainingWorker(int clients, int rounds) {
+            this.clients = clients;
+            this.rounds = rounds;
+        }
+
+        @Override
+        protected Void doInBackground() throws Exception {
+            // reset all nodes to READY
+            for (int i = 0; i < clients; i++) publish(new UiStatus(i, READY));
+
+            // Simulate FL: sample a fraction each round
+            double sampleFraction = 0.25; // 25% participation per round (demo-friendly)
+
+            for (int r = 1; r <= rounds; r++) {
+                if (isCancelled()) break;
+
+                publish(new UiLog("[ROUND " + r + "] selecting clients...\n"));
+
+                int k = Math.max(1, (int) Math.round(clients * sampleFraction));
+                List<Integer> indices = new ArrayList<>(clients);
+                for (int i = 0; i < clients; i++) indices.add(i);
+                Collections.shuffle(indices, rnd);
+                List<Integer> selected = indices.subList(0, k);
+
+                // mark selected TRAINING
+                for (int idx : selected) publish(new UiStatus(idx, TRAINING));
+
+                publish(new UiLog("[ROUND " + r + "] local training (" + k + " clients)...\n"));
+                Thread.sleep(250 + rnd.nextInt(250));
+
+                // mark results (small chance of error)
+                int errors = 0;
+                for (int idx : selected) {
+                    boolean fail = rnd.nextDouble() < 0.02; // 2% demo failures
+                    if (fail) {
+                        errors++;
+                        publish(new UiStatus(idx, ERROR));
+                    } else {
+                        publish(new UiStatus(idx, DONE));
+                    }
+                }
+
+                publish(new UiLog("[ROUND " + r + "] aggregation complete. errors=" + errors + "\n"));
+
+                int pct = (int) Math.round((r * 100.0) / rounds);
+                publish(new UiProgress("Round " + r + "/" + rounds, pct));
+
+                // Briefly show DONE, then return non-error nodes to READY (looks realistic for next round)
+                Thread.sleep(200);
+                for (int idx : selected) {
+                    // keep ERROR as ERROR
+                    // if currently DONE, revert to READY for next round
+                    publish(new UiStatus(idx, READY));
+                }
+            }
+
+            return null;
+        }
+
+        @Override
+        protected void process(List<UiEvent> chunks) {
+            for (UiEvent e : chunks) {
+                if (e instanceof UiLog l) {
+                    append(l.msg());
+                } else if (e instanceof UiStatus s) {
+                    setNodeStatus(s.row(), s.status());
+                } else if (e instanceof UiProgress p) {
+                    progress.setValue(p.percent());
+                    progress.setString(p.label());
+                }
+            }
+        }
+
+        @Override
+        protected void done() {
+            startBtn.setEnabled(true);
+            stopBtn.setEnabled(false);
+
+            if (isCancelled()) {
+                progress.setValue(0);
+                progress.setString("Cancelled");
+                append("[INFO] Simulation cancelled.\n");
+            } else {
+                progress.setValue(100);
+                progress.setString("Done");
+                append("[INFO] Simulation complete.\n");
+            }
+        }
+    }
+
+    private static class StatusRenderer extends DefaultTableCellRenderer {
+        @Override
+        public Component getTableCellRendererComponent(JTable table, Object value,
+                                                       boolean isSelected, boolean hasFocus,
+                                                       int row, int column) {
+            Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+	private record UiProgress(int percent, String label) implements UiEvent {};
+            if (!isSelected) {
+                String s = String.valueOf(value);
+                switch (s) {
+                    case READY -> c.setBackground(new Color(220, 240, 255));
+                    case TRAINING -> c.setBackground(new Color(255, 245, 200));
+                    case DONE -> c.setBackground(new Color(215, 255, 215));
+                    case ERROR -> c.setBackground(new Color(255, 215, 215));
+                    default -> c.setBackground(Color.WHITE);
+                }
+            }
+            return c;
+        }
+    }
+}
+//private record UiProgress(int percent, String label) implements UiEvent {}
+/*
+/package com.registration.app.federatedidsartefact.ui;
+package com.registration.app.federatedidsartefact.ui;
+
+import javax.swing.*;
+import javax.swing.table.DefaultTableCellRenderer;
+import javax.swing.table.DefaultTableModel;
+import java.awt.*;
+import java.io.BufferedReader;
+import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.Arrays;
+//package com.registration.app.federatedidsartefact.ui;
+
+public class MainFrame extends JFrame
+{
+
+	private static final int MAX_UI_NODES = 2000;
+
+	private final JTextArea log = new JTextArea();
+	private final JTextField clientsField = new JTextField("30");
+	private final JTextField roundsField = new JTextField("15");
+
+	private final DefaultTableModel csvModel = new DefaultTableModel();
+	private final JTable csvTable = new JTable(csvModel);
+	private final JLabel csvPathLabel = new JLabel("No dataset selected");
+
+	private final DefaultTableModel nodesModel
+		= new DefaultTableModel(new Object[]
+		{
+		"Node", "Status"
+		}, 0)
+	{
+		@Override
+		public boolean isCellEditable(int row, int col)
+		{
+			return false;
+		}
+	};
+	private final JTable nodesTable = new JTable(nodesModel);
+
+	public MainFrame()
+	{
+		super("Federated IDS Demonstrator (Swing)");
+		setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+		setSize(1100, 700);
+		setLocationRelativeTo(null);
+
+		setLayout(new BorderLayout());
+		add(buildTopControls(), BorderLayout.NORTH);
+		add(buildTabs(), BorderLayout.CENTER);
+		add(buildStatusBar(), BorderLayout.SOUTH);
+
+		log.setEditable(false);
+		log.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+	}
+
+	private JComponent buildTopControls()
+	{
+		JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT));
+
+		JButton start = new JButton("Start");
+		JButton stop = new JButton("Stop");
+
+		clientsField.setColumns(10);
+		roundsField.setColumns(6);
+
+		start.addActionListener(e -> append("[INFO] Start clicked (wire to FL loop next)\n"));
+		stop.addActionListener(e -> append("[INFO] Stop clicked (wire cancellation next)\n"));
+
+		p.add(new JLabel("Clients:"));
+		p.add(clientsField);
+		p.add(new JLabel("Rounds:"));
+		p.add(roundsField);
+		p.add(start);
+		p.add(stop);
+
+		return p;
+	}
+
+	private JComponent buildTabs()
+	{
+		JTabbedPane tabs = new JTabbedPane();
+		tabs.addTab("Data", buildDataTab());
+		tabs.addTab("Nodes", buildNodesTab());
+		tabs.addTab("Training Log", new JScrollPane(log));
+		tabs.addTab("Results", buildResultsTab());
+		return tabs;
+	}
+
+	private JComponent buildDataTab()
+	{
+		JPanel root = new JPanel(new BorderLayout(8, 8));
+
+		JButton choose = new JButton("Choose CSV...");
+		choose.addActionListener(e ->
+			{
+			JFileChooser fc = new JFileChooser();
+			int res = fc.showOpenDialog(this);
+			if (res == JFileChooser.APPROVE_OPTION)
+				{
+				File f = fc.getSelectedFile();
+				csvPathLabel.setText(f.getAbsolutePath());
+				loadCsvPreview(f);
+				}
+			});
+
+		JPanel top = new JPanel(new BorderLayout(8, 8));
+		top.add(choose, BorderLayout.WEST);
+		top.add(csvPathLabel, BorderLayout.CENTER);
+
+		csvTable.setFillsViewportHeight(true);
+
+		root.add(top, BorderLayout.NORTH);
+		root.add(new JScrollPane(csvTable), BorderLayout.CENTER);
+
+		return root;
+	}
+
+	private JComponent buildNodesTab()
+	{
+		JPanel root = new JPanel(new BorderLayout(8, 8));
+
+		JButton apply = new JButton("Apply from Clients field");
+		apply.addActionListener(e ->
+			{
+			int requested = parseIntSafe(clientsField.getText(), 30);
+			int shown = clampUiNodes(requested);
+			populateNodes(shown);
+			});
+
+		JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		top.add(new JLabel("Displayed nodes capped at " + MAX_UI_NODES + " to keep UI responsive."));
+		top.add(apply);
+
+		nodesTable.setFillsViewportHeight(true);
+		nodesTable.getColumnModel().getColumn(1).setCellRenderer(new StatusRenderer());
+
+		root.add(top, BorderLayout.NORTH);
+		root.add(new JScrollPane(nodesTable), BorderLayout.CENTER);
+
+		populateNodes(clampUiNodes(parseIntSafe(clientsField.getText(), 30)));
+		return root;
+	}
+
+	private JComponent buildResultsTab()
+	{
+		JPanel root = new JPanel(new BorderLayout());
+		JLabel hint = new JLabel("Next: metrics per round (Accuracy, F1, Drift events).");
+		hint.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+		root.add(hint, BorderLayout.NORTH);
+		return root;
+	}
+
+	private JComponent buildStatusBar()
+	{
+		JPanel p = new JPanel(new BorderLayout());
+		JLabel status = new JLabel("Ready");
+		status.setBorder(BorderFactory.createEmptyBorder(6, 10, 6, 10));
+		p.add(status, BorderLayout.WEST);
+		return p;
+	}
+
+	private void loadCsvPreview(File f)
+	{
+		csvModel.setRowCount(0);
+		csvModel.setColumnCount(0);
+
+		try (BufferedReader br = Files.newBufferedReader(f.toPath(), StandardCharsets.UTF_8))
+			{
+			String header = br.readLine();
+			if (header == null)
+				{
+				append("[ERROR] Empty file.\n");
+				return;
+				}
+
+			String[] headers = header.split(",", -1);
+			for (String h : headers)
+				{
+				csvModel.addColumn(h.trim());
+				}
+
+			for (int i = 0; i < 50; i++)
+				{
+				String line = br.readLine();
+				if (line == null)
+					{
+					break;
+					}
+
+				String[] parts = line.split(",", -1);
+				if (parts.length < headers.length)
+					{
+					parts = Arrays.copyOf(parts, headers.length);
+					}
+				csvModel.addRow(parts);
+				}
+
+			append("[INFO] Preview loaded: " + f.getName() + "\n");
+			} catch (Exception ex)
+			{
+			append("[ERROR] Failed to preview CSV: " + ex.getMessage() + "\n");
+			}
+	}
+
+	private void populateNodes(int n)
+	{
+		nodesModel.setRowCount(0);
+		for (int i = 1; i <= n; i++)
+			{
+			nodesModel.addRow(new Object[]
+				{
+				"Client-" + i, "READY"
+				});
+			}
+		append("[INFO] Nodes displayed: " + n + "\n");
+	}
+
+	private int clampUiNodes(int requested)
+	{
+		if (requested > MAX_UI_NODES)
+			{
+			append("[WARN] Requested " + requested + " nodes. UI capped to " + MAX_UI_NODES + ".\n");
+			return MAX_UI_NODES;
+			}
+		return Math.max(1, requested);
+	}
+
+	private void append(String s)
+	{
+		log.append(s);
+		log.setCaretPosition(log.getDocument().getLength());
+	}
+
+	private static int parseIntSafe(String s, int fallback)
+	{
+		try
+			{
+			return Integer.parseInt(s.trim());
+			} catch (Exception ex)
+			{
+			return fallback;
+			}
+	}
+
+	private static class StatusRenderer extends DefaultTableCellRenderer
+	{
+
+		@Override
+		public Component getTableCellRendererComponent(JTable table, Object value,
+			boolean isSelected, boolean hasFocus,
+			int row, int column)
+		{
+			Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+			if (!isSelected)
+				{
+				String s = String.valueOf(value);
+				switch (s)
+					{
+					case "READY" ->
+						c.setBackground(new Color(220, 240, 255));
+					case "TRAINING" ->
+						c.setBackground(new Color(255, 245, 200));
+					case "DONE" ->
+						c.setBackground(new Color(215, 255, 215));
+					case "ERROR" ->
+						c.setBackground(new Color(255, 215, 215));
+					default ->
+						c.setBackground(Color.WHITE);
+					}
+				}
+			return c;
+		}
+	}
+}
+*/

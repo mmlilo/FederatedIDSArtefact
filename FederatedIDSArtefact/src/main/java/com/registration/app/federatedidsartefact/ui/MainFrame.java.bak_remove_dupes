@@ -1,0 +1,1387 @@
+package com.registration.app.federatedidsartefact.ui;
+
+import javax.swing.*;
+import javax.swing.table.DefaultTableCellRenderer;
+import javax.swing.table.DefaultTableModel;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
+import java.io.BufferedReader;
+import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class MainFrame extends JFrame
+{
+
+	private static final int MAX_VISIBLE_UI_NODES = 500;
+
+	private static final String READY = "READY";
+	private static final String TRAINING = "TRAINING";
+	private static final String DONE = "DONE";
+	private static final String ERROR = "ERROR";
+
+	private File selectedDatasetFile = null;
+
+	private final JButton generatePartitionsBtn = new JButton("Generate Full Partitions");
+	private final JTextArea fullPartitionArea = new JTextArea(12, 30);
+
+	private final List<String[]> fullDatasetRows = new ArrayList<>();
+	private String[] fullDatasetHeaders = new String[0];
+
+	private final Map<String, List<String[]>> generatedPartitions = new LinkedHashMap<>();
+
+	private final JTextArea log = new JTextArea();
+	private final JProgressBar progress = new JProgressBar(0, 100);
+
+	private final JLabel previewRowsLabel = new JLabel("Preview rows: 0");
+	private final JLabel totalColumnsLabel = new JLabel("Columns: 0");
+	private final JLabel selectedLabelColumnLabel = new JLabel("Label column: none");
+
+	private final JComboBox<String> labelColumnCombo = new JComboBox<>();
+	private final JTextArea labelPreviewArea = new JTextArea(6, 30);
+
+	private final JTextField clientsField = new JTextField("30");
+	private final JTextField roundsField = new JTextField("15");
+
+	private final JTextField benignValueField = new JTextField("BENIGN", 12);
+	private final JTextField attackValueField = new JTextField("ATTACK", 12);
+
+	private final JComboBox<String> partitionTypeCombo = new JComboBox<>(new String[]
+		{
+		"IID", "Non-IID"
+		});
+	private final JSpinner clientPreviewSpinner = new JSpinner(new SpinnerNumberModel(5, 1, 1000, 1));
+
+	private final JTextArea partitionPreviewArea = new JTextArea(10, 30);
+
+	private int previewedRowCount = 0;
+
+	private JButton startBtn;
+	private JButton stopBtn;
+
+	private final DefaultTableModel csvModel = new DefaultTableModel();
+	private final JTable csvTable = new JTable(csvModel);
+	private final JLabel csvPathLabel = new JLabel("No dataset selected");
+
+	private final DefaultTableModel nodesModel
+		= new DefaultTableModel(new Object[]
+		{
+		"Node", "Status"
+		}, 0)
+	{
+		@Override
+		public boolean isCellEditable(int r, int c)
+		{
+			return false;
+		}
+	};
+
+	private final JTable nodesTable = new JTable(nodesModel);
+
+	private final JLabel totalClientsLabel = new JLabel("Total clients: 0");
+	private final JLabel visibleClientsLabel = new JLabel("Visible clients: 0");
+	private final JLabel trainingCountLabel = new JLabel("Training: 0");
+	private final JLabel doneCountLabel = new JLabel("Done: 0");
+	private final JLabel errorCountLabel = new JLabel("Errors: 0");
+
+	private TrainingWorker worker;
+
+	private int totalSimulatedClients = 0;
+	private int visibleClients = 0;
+
+	private int trainingCount = 0;
+	private int doneCount = 0;
+	private int errorCount = 0;
+
+	public MainFrame()
+	{
+		super("Federated IDS Demonstrator (Swing)");
+		setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+		setSize(1200, 760);
+		setLocationRelativeTo(null);
+
+		setLayout(new BorderLayout());
+		add(buildTopControls(), BorderLayout.NORTH);
+		add(buildTabs(), BorderLayout.CENTER);
+		add(buildStatusBar(), BorderLayout.SOUTH);
+
+		log.setEditable(false);
+		log.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+	}
+
+	private JComponent buildTopControls()
+	{
+		JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT));
+
+		startBtn = new JButton("Start");
+		stopBtn = new JButton("Stop");
+		stopBtn.setEnabled(false);
+
+		clientsField.setColumns(10);
+		roundsField.setColumns(6);
+
+		startBtn.addActionListener(e -> startSimulation());
+		stopBtn.addActionListener(e -> stopSimulation());
+
+		p.add(new JLabel("Clients:"));
+		p.add(clientsField);
+		p.add(new JLabel("Rounds:"));
+		p.add(roundsField);
+		p.add(startBtn);
+		p.add(stopBtn);
+
+		return p;
+	}
+
+	private JComponent buildNodesTab()
+	{
+		JPanel root = new JPanel(new BorderLayout(8, 8));
+
+		nodesTable.setFillsViewportHeight(true);
+		nodesTable.getColumnModel().getColumn(1).setCellRenderer(new StatusRenderer());
+
+		JButton apply = new JButton("Apply Clients -> Nodes Table");
+		apply.addActionListener(e ->
+			{
+			int requested = parseIntSafe(clientsField.getText(), 30);
+			initialiseNodeView(requested);
+			append("[INFO] Applied client count to dashboard.\n");
+			});
+
+		JPanel top = new JPanel(new BorderLayout());
+
+		JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		left.add(new JLabel("UI shows only first " + MAX_VISIBLE_UI_NODES + " nodes to stay responsive."));
+		left.add(apply);
+
+		JPanel right = new JPanel(new GridLayout(2, 3, 10, 4));
+		right.add(totalClientsLabel);
+		right.add(visibleClientsLabel);
+		right.add(trainingCountLabel);
+		right.add(doneCountLabel);
+		right.add(errorCountLabel);
+
+		top.add(left, BorderLayout.WEST);
+		top.add(right, BorderLayout.EAST);
+
+		root.add(top, BorderLayout.NORTH);
+		root.add(new JScrollPane(nodesTable), BorderLayout.CENTER);
+
+		initialiseNodeView(parseIntSafe(clientsField.getText(), 30));
+
+		return root;
+	}
+
+	private void generateIIDPartitions(int clientCount, List<String[]> benignRows,
+		List<String[]> attackRows, List<String[]> otherRows)
+	{
+		List<String[]> allRows = new ArrayList<>();
+		allRows.addAll(benignRows);
+		allRows.addAll(attackRows);
+		allRows.addAll(otherRows);
+
+		Collections.shuffle(allRows, new Random());
+
+		for (int i = 1; i <= clientCount; i++)
+			{
+			generatedPartitions.put("Client-" + i, new ArrayList<>());
+			}
+
+		for (int i = 0; i < allRows.size(); i++)
+			{
+			String clientId = "Client-" + ((i % clientCount) + 1);
+			generatedPartitions.get(clientId).add(allRows.get(i));
+			}
+	}
+
+	private int findHeaderIndex(String columnName)
+	{
+		for (int i = 0; i < fullDatasetHeaders.length; i++)
+			{
+			if (fullDatasetHeaders[i].trim().equals(columnName))
+				{
+				return i;
+				}
+			}
+		return -1;
+	}
+
+	private void generateNonIIDPartitions(int clientCount, List<String[]> benignRows,
+		List<String[]> attackRows, List<String[]> otherRows)
+	{
+		for (int i = 1; i <= clientCount; i++)
+			{
+			generatedPartitions.put("Client-" + i, new ArrayList<>());
+			}
+
+		int half = Math.max(1, clientCount / 2);
+
+		int benignIndex = 0;
+		int attackIndex = 0;
+		int otherIndex = 0;
+
+		for (int i = 1; i <= half; i++)
+			{
+			String clientId = "Client-" + i;
+			List<String[]> partition = generatedPartitions.get(clientId);
+
+			int share = Math.max(1, benignRows.size() / half);
+			for (int j = 0; j < share && benignIndex < benignRows.size(); j++)
+				{
+				partition.add(benignRows.get(benignIndex++));
+				}
+			}
+
+		for (int i = half + 1; i <= clientCount; i++)
+			{
+			String clientId = "Client-" + i;
+			List<String[]> partition = generatedPartitions.get(clientId);
+
+			int denom = Math.max(1, clientCount - half);
+			int share = Math.max(1, attackRows.size() / denom);
+			for (int j = 0; j < share && attackIndex < attackRows.size(); j++)
+				{
+				partition.add(attackRows.get(attackIndex++));
+				}
+			}
+
+		int clientPointer = 1;
+		while (benignIndex < benignRows.size())
+			{
+			generatedPartitions.get("Client-" + clientPointer).add(benignRows.get(benignIndex++));
+			clientPointer = (clientPointer % clientCount) + 1;
+			}
+
+		while (attackIndex < attackRows.size())
+			{
+			generatedPartitions.get("Client-" + clientPointer).add(attackRows.get(attackIndex++));
+			clientPointer = (clientPointer % clientCount) + 1;
+			}
+
+		while (otherIndex < otherRows.size())
+			{
+			generatedPartitions.get("Client-" + clientPointer).add(otherRows.get(otherIndex++));
+			clientPointer = (clientPointer % clientCount) + 1;
+			}
+	}
+
+	private void renderFullPartitionSummary(String partitionType, int benignCount,
+		int attackCount, int otherCount)
+	{
+		StringBuilder sb = new StringBuilder();
+
+		sb.append("Full dataset partition generation\n");
+		sb.append("========================================\n");
+		sb.append("Partition type: ").append(partitionType).append("\n");
+		sb.append("Total loaded rows: ").append(fullDatasetRows.size()).append("\n");
+		sb.append("Benign rows: ").append(benignCount).append("\n");
+		sb.append("Attack rows: ").append(attackCount).append("\n");
+		sb.append("Other rows: ").append(otherCount).append("\n");
+		sb.append("Clients generated: ").append(generatedPartitions.size()).append("\n\n");
+
+		sb.append("Client partition sizes\n");
+		sb.append("----------------------------------------\n");
+
+		for (Map.Entry<String, List<String[]>> entry : generatedPartitions.entrySet())
+			{
+			sb.append(entry.getKey())
+				.append(": ")
+				.append(entry.getValue().size())
+				.append(" rows\n");
+			}
+
+		fullPartitionArea.setText(sb.toString());
+		fullPartitionArea.setCaretPosition(0);
+	}
+
+	private void generateFullDatasetPartitions()
+	{
+		generatedPartitions.clear();
+		fullPartitionArea.setText("");
+
+		if (selectedDatasetFile == null)
+			{
+			fullPartitionArea.setText("No dataset selected.");
+			return;
+			}
+
+		if (fullDatasetRows.isEmpty())
+			{
+			fullPartitionArea.setText("Dataset rows are not loaded.");
+			return;
+			}
+
+		Object selected = labelColumnCombo.getSelectedItem();
+		if (selected == null)
+			{
+			fullPartitionArea.setText("No label column selected.");
+			return;
+			}
+
+		String labelColumn = selected.toString();
+		int labelColIndex = findHeaderIndex(labelColumn);
+
+		if (labelColIndex < 0)
+			{
+			fullPartitionArea.setText("Could not find selected label column.");
+			return;
+			}
+
+		String benignValue = benignValueField.getText().trim();
+		String attackValue = attackValueField.getText().trim();
+		String partitionType = partitionTypeCombo.getSelectedItem().toString();
+		int clientCount = (Integer) clientPreviewSpinner.getValue();
+
+		List<String[]> benignRows = new ArrayList<>();
+		List<String[]> attackRows = new ArrayList<>();
+		List<String[]> otherRows = new ArrayList<>();
+
+		for (String[] row : fullDatasetRows)
+			{
+			String value = "";
+			if (labelColIndex < row.length && row[labelColIndex] != null)
+				{
+				value = row[labelColIndex].trim();
+				}
+
+			if (value.equalsIgnoreCase(benignValue))
+				{
+				benignRows.add(row);
+				} else if (value.equalsIgnoreCase(attackValue))
+				{
+				attackRows.add(row);
+				} else
+				{
+				otherRows.add(row);
+				}
+			}
+
+		if ("IID".equalsIgnoreCase(partitionType))
+			{
+			generateIIDPartitions(clientCount, benignRows, attackRows, otherRows);
+			} else
+			{
+			generateNonIIDPartitions(clientCount, benignRows, attackRows, otherRows);
+			}
+
+		renderFullPartitionSummary(partitionType, benignRows.size(), attackRows.size(), otherRows.size());
+		append("[INFO] Full dataset partitions generated: " + generatedPartitions.size() + " clients\n");
+	}
+
+	private JComponent buildTabs()
+	{
+		JTabbedPane tabs = new JTabbedPane();
+
+		tabs.addTab("Data", buildDataTab());
+		tabs.addTab("Nodes", buildNodesTab());
+		tabs.addTab("Training Log", new JScrollPane(log));
+		tabs.addTab("Results", buildResultsTab());
+
+		return tabs;
+	}
+
+	private void loadCsvPreview(File file)
+	{
+		csvModel.setRowCount(0);
+		csvModel.setColumnCount(0);
+		labelColumnCombo.removeAllItems();
+		labelPreviewArea.setText("");
+		partitionPreviewArea.setText("");
+		fullPartitionArea.setText("");
+		previewRowsLabel.setText("Preview rows: 0");
+		totalColumnsLabel.setText("Columns: 0");
+		selectedLabelColumnLabel.setText("Label column: none");
+		previewedRowCount = 0;
+
+		fullDatasetRows.clear();
+		fullDatasetHeaders = new String[0];
+		generatedPartitions.clear();
+
+		try (BufferedReader br = Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8))
+			{
+			String headerLine = br.readLine();
+
+			if (headerLine == null)
+				{
+				append("[ERROR] Selected file is empty.\n");
+				return;
+				}
+
+			String[] headers = headerLine.split(",", -1);
+			fullDatasetHeaders = headers;
+
+			for (String header : headers)
+				{
+				String cleanHeader = header.trim();
+				csvModel.addColumn(cleanHeader);
+				labelColumnCombo.addItem(cleanHeader);
+				}
+
+			int previewCount = 0;
+			String line;
+
+			while ((line = br.readLine()) != null)
+				{
+				String[] parts = line.split(",", -1);
+
+				if (parts.length < headers.length)
+					{
+					parts = Arrays.copyOf(parts, headers.length);
+					}
+
+				fullDatasetRows.add(parts);
+
+				if (previewCount < 50)
+					{
+					csvModel.addRow(parts);
+					previewCount++;
+					}
+				}
+
+			previewedRowCount = previewCount;
+			previewRowsLabel.setText("Preview rows: " + previewCount);
+			totalColumnsLabel.setText("Columns: " + headers.length);
+
+			if (labelColumnCombo.getItemCount() > 0)
+				{
+				labelColumnCombo.setSelectedIndex(headers.length - 1);
+				}
+
+			append("[INFO] CSV preview loaded: " + file.getName() + "\n");
+			append("[INFO] Full dataset rows loaded into memory: " + fullDatasetRows.size() + "\n");
+
+			updatePartitionPreview();
+			} catch (Exception ex)
+			{
+			append("[ERROR] Failed to load CSV preview: " + ex.getMessage() + "\n");
+			}
+	}
+
+	private JComponent buildDataTab()
+	{
+		JPanel root = new JPanel(new BorderLayout(10, 10));
+
+		JButton chooseBtn = new JButton("Choose CSV...");
+		chooseBtn.addActionListener(e ->
+			{
+			JFileChooser chooser = new JFileChooser();
+			int result = chooser.showOpenDialog(this);
+
+			if (result == JFileChooser.APPROVE_OPTION)
+				{
+				File file = chooser.getSelectedFile();
+				selectedDatasetFile = file;
+				csvPathLabel.setText(file.getAbsolutePath());
+				loadCsvPreview(file);
+				}
+			});
+
+		generatePartitionsBtn.addActionListener(e -> generateFullDatasetPartitions());
+
+		labelColumnCombo.addActionListener(e ->
+			{
+			Object selected = labelColumnCombo.getSelectedItem();
+			if (selected != null)
+				{
+				selectedLabelColumnLabel.setText("Label column: " + selected.toString());
+				previewSelectedLabelValues(selected.toString());
+				updatePartitionPreview();
+				}
+			});
+
+		partitionTypeCombo.addActionListener(e -> updatePartitionPreview());
+		benignValueField.addActionListener(e -> updatePartitionPreview());
+		attackValueField.addActionListener(e -> updatePartitionPreview());
+		clientPreviewSpinner.addChangeListener(e -> updatePartitionPreview());
+
+		JPanel filePanel = new JPanel(new BorderLayout(8, 8));
+		filePanel.add(chooseBtn, BorderLayout.WEST);
+		filePanel.add(csvPathLabel, BorderLayout.CENTER);
+
+		JPanel summaryPanel = new JPanel(new GridLayout(3, 4, 8, 4));
+		summaryPanel.add(previewRowsLabel);
+		summaryPanel.add(totalColumnsLabel);
+		summaryPanel.add(selectedLabelColumnLabel);
+		summaryPanel.add(new JLabel("Select label column:"));
+
+		summaryPanel.add(new JLabel("Benign value:"));
+		summaryPanel.add(benignValueField);
+		summaryPanel.add(new JLabel("Attack value:"));
+		summaryPanel.add(attackValueField);
+
+		summaryPanel.add(new JLabel("Partition type:"));
+		summaryPanel.add(partitionTypeCombo);
+		summaryPanel.add(new JLabel("Client preview count:"));
+		summaryPanel.add(clientPreviewSpinner);
+
+		JPanel labelPanel = new JPanel(new BorderLayout(8, 8));
+		labelPanel.add(summaryPanel, BorderLayout.CENTER);
+		labelPanel.add(labelColumnCombo, BorderLayout.SOUTH);
+
+		JPanel partitionControlPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		partitionControlPanel.add(generatePartitionsBtn);
+
+		JPanel top = new JPanel(new BorderLayout(8, 8));
+		top.add(filePanel, BorderLayout.NORTH);
+		top.add(labelPanel, BorderLayout.CENTER);
+		top.add(partitionControlPanel, BorderLayout.SOUTH);
+
+		csvTable.setFillsViewportHeight(true);
+		csvTable.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
+
+		labelPreviewArea.setEditable(false);
+		labelPreviewArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+		labelPreviewArea.setBorder(BorderFactory.createTitledBorder("Sample values from selected label column"));
+
+		partitionPreviewArea.setEditable(false);
+		partitionPreviewArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+		partitionPreviewArea.setBorder(BorderFactory.createTitledBorder("Partition preview"));
+
+		fullPartitionArea.setEditable(false);
+		fullPartitionArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+		fullPartitionArea.setBorder(BorderFactory.createTitledBorder("Full dataset partition generation"));
+
+		JSplitPane rightSplit = new JSplitPane(
+			JSplitPane.VERTICAL_SPLIT,
+			new JScrollPane(partitionPreviewArea),
+			new JScrollPane(fullPartitionArea)
+		);
+		rightSplit.setResizeWeight(0.5);
+
+		JSplitPane lowerSplit = new JSplitPane(
+			JSplitPane.HORIZONTAL_SPLIT,
+			new JScrollPane(labelPreviewArea),
+			rightSplit
+		);
+		lowerSplit.setResizeWeight(0.35);
+
+		JSplitPane mainSplit = new JSplitPane(
+			JSplitPane.VERTICAL_SPLIT,
+			new JScrollPane(csvTable),
+			lowerSplit
+		);
+		mainSplit.setResizeWeight(0.65);
+
+		root.add(top, BorderLayout.NORTH);
+		root.add(mainSplit, BorderLayout.CENTER);
+
+		return root;
+	}
+
+	private JComponent buildResultsTab()
+	{
+		JPanel panel = new JPanel(new BorderLayout());
+		JTextArea summary = new JTextArea();
+		summary.setEditable(false);
+		summary.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
+		summary.setText(
+			"Scaling mode enabled.\n\n"
+			+ "This demo now separates:\n"
+			+ "1. Total simulated clients\n"
+			+ "2. Visible dashboard clients\n\n"
+			+ "The backend may simulate thousands of nodes,\n"
+			+ "while the UI displays only a manageable subset."
+		);
+		panel.add(new JScrollPane(summary), BorderLayout.CENTER);
+		return panel;
+	}
+
+	private JComponent buildStatusBar()
+	{
+		JPanel p = new JPanel(new BorderLayout());
+		progress.setStringPainted(true);
+		progress.setValue(0);
+		progress.setString("Idle");
+		p.add(progress, BorderLayout.CENTER);
+		return p;
+	}
+
+	private JComponent placeholder(String msg)
+	{
+		JTextArea a = new JTextArea(msg);
+		a.setEditable(false);
+		a.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+		a.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
+		return new JScrollPane(a);
+	}
+
+	private void initialiseNodeView(int requestedClients)
+	{
+		totalSimulatedClients = Math.max(1, requestedClients);
+		visibleClients = Math.min(totalSimulatedClients, MAX_VISIBLE_UI_NODES);
+
+		nodesModel.setRowCount(0);
+		for (int i = 1; i <= visibleClients; i++)
+			{
+			nodesModel.addRow(new Object[]
+				{
+				"Client-" + i, READY
+				});
+			}
+
+		trainingCount = 0;
+		doneCount = 0;
+		errorCount = 0;
+
+		refreshSummaryLabels();
+	}
+
+	private void refreshSummaryLabels()
+	{
+		totalClientsLabel.setText("Total clients: " + totalSimulatedClients);
+		visibleClientsLabel.setText("Visible clients: " + visibleClients);
+		trainingCountLabel.setText("Training: " + trainingCount);
+		doneCountLabel.setText("Done: " + doneCount);
+		errorCountLabel.setText("Errors: " + errorCount);
+	}
+
+	private void startSimulation()
+	{
+		if (worker != null && !worker.isDone())
+			{
+			append("[WARN] Already running.\n");
+			return;
+			}
+
+		int requestedClients = parseIntSafe(clientsField.getText(), 30);
+		int rounds = Math.max(1, parseIntSafe(roundsField.getText(), 15));
+
+		initialiseNodeView(requestedClients);
+
+		append("[INFO] Starting simulation...\n");
+		append("[INFO] Total simulated clients: " + totalSimulatedClients + "\n");
+		append("[INFO] Visible dashboard clients: " + visibleClients + "\n");
+		append("[INFO] Rounds: " + rounds + "\n");
+
+		if (totalSimulatedClients > visibleClients)
+			{
+			append("[INFO] Dashboard capped to first " + visibleClients + " clients for responsiveness.\n");
+			}
+
+		startBtn.setEnabled(false);
+		stopBtn.setEnabled(true);
+		progress.setValue(0);
+		progress.setString("Running...");
+
+		worker = new TrainingWorker(totalSimulatedClients, rounds);
+		worker.execute();
+	}
+
+	private void stopSimulation()
+	{
+		if (worker != null && !worker.isDone())
+			{
+			worker.cancel(true);
+			append("[INFO] Stop requested.\n");
+			}
+	}
+
+	private void setNodeStatus(int zeroBasedIndex, String status)
+	{
+		if (zeroBasedIndex >= 0 && zeroBasedIndex < nodesModel.getRowCount())
+			{
+			nodesModel.setValueAt(status, zeroBasedIndex, 1);
+			}
+	}
+
+	private void append(String s)
+	{
+		log.append(s);
+		log.setCaretPosition(log.getDocument().getLength());
+	}
+
+	private static int parseIntSafe(String s, int fallback)
+	{
+		try
+			{
+			return Integer.parseInt(s.trim().replace(",", ""));
+			} catch (Exception ex)
+			{
+			return fallback;
+			}
+	}
+
+	private String getClientIdFromIndex(int zeroBasedIndex)
+	{
+		return "Client-" + (zeroBasedIndex + 1);
+	}
+
+	private int getPartitionSize(String clientId)
+	{
+		List<String[]> rows = generatedPartitions.get(clientId);
+		return rows == null ? 0 : rows.size();
+	}
+
+	private String describePartitionType(String clientId)
+	{
+		List<String[]> rows = generatedPartitions.get(clientId);
+
+		if (rows == null || rows.isEmpty())
+			{
+			return "no data";
+			}
+
+		Object selected = labelColumnCombo.getSelectedItem();
+		if (selected == null)
+			{
+			return "unknown";
+			}
+
+		int labelColIndex = findHeaderIndex(selected.toString());
+		if (labelColIndex < 0)
+			{
+			return "unknown";
+			}
+
+		String benignValue = benignValueField.getText().trim();
+		String attackValue = attackValueField.getText().trim();
+
+		int benign = 0;
+		int attack = 0;
+		int other = 0;
+
+		for (String[] row : rows)
+			{
+			String value = "";
+			if (labelColIndex < row.length && row[labelColIndex] != null)
+				{
+				value = row[labelColIndex].trim();
+				}
+
+			if (value.equalsIgnoreCase(benignValue))
+				{
+				benign++;
+				} else if (value.equalsIgnoreCase(attackValue))
+				{
+				attack++;
+				} else
+				{
+				other++;
+				}
+			}
+
+		if (benign > attack && benign > other)
+			{
+			return "mostly benign";
+			} else if (attack > benign && attack > other)
+			{
+			return "mostly attack";
+			} else
+			{
+			return "mixed";
+			}
+	}
+
+	private boolean hasGeneratedPartitions()
+	{
+		return generatedPartitions != null && !generatedPartitions.isEmpty();
+	}
+
+	private interface UiEvent
+	{
+	}
+
+	private static final class LogEvent implements UiEvent
+	{
+
+		final String msg;
+
+		LogEvent(String m)
+		{
+			msg = m;
+		}
+	}
+
+	private static final class StatusEvent implements UiEvent
+	{
+
+		final int row;
+		final String st;
+
+		StatusEvent(int r, String s)
+		{
+			row = r;
+			st = s;
+		}
+	}
+
+	private static final class ProgressEvent implements UiEvent
+	{
+
+		final String label;
+		final int pct;
+
+		ProgressEvent(String label, int pct)
+		{
+			this.label = label;
+			this.pct = pct;
+		}
+	}
+
+	private static final class SummaryEvent implements UiEvent
+	{
+
+		final int training;
+		final int done;
+		final int errors;
+
+		SummaryEvent(int training, int done, int errors)
+		{
+			this.training = training;
+			this.done = done;
+			this.errors = errors;
+		}
+	}
+
+	private final class TrainingWorker extends SwingWorker<Void, UiEvent>
+	{
+
+		private final int clients;
+		private final int rounds;
+		private final Random rnd = new Random();
+
+		TrainingWorker(int clients, int rounds)
+		{
+			this.clients = clients;
+			this.rounds = rounds;
+		}
+
+		@Override
+		protected Void doInBackground() throws Exception
+		{
+			for (int i = 0; i < visibleClients; i++)
+				{
+				publish(new StatusEvent(i, READY));
+				}
+
+			double sampleFraction = clients > 500 ? 0.05 : 0.25;
+
+			for (int r = 1; r <= rounds; r++)
+				{
+				if (isCancelled())
+					{
+					break;
+					}
+
+				publish(new LogEvent("[ROUND " + r + "] selecting clients...\n"));
+
+				int k = Math.max(1, (int) Math.round(clients * sampleFraction));
+				List<Integer> idxs = new ArrayList<>(clients);
+				for (int i = 0; i < clients; i++)
+					{
+					idxs.add(i);
+					}
+
+				Collections.shuffle(idxs, rnd);
+				List<Integer> selected = idxs.subList(0, k);
+
+				int currentTraining = selected.size();
+				int currentDone = 0;
+				int currentErrors = 0;
+
+				for (int idx : selected)
+					{
+					if (idx < visibleClients)
+						{
+						publish(new StatusEvent(idx, TRAINING));
+						}
+					}
+
+				publish(new SummaryEvent(currentTraining, currentDone, currentErrors));
+				publish(new LogEvent("[ROUND " + r + "] local training (" + k + " clients)...\n"));
+
+				Thread.sleep(250 + rnd.nextInt(250));
+
+				for (int idx : selected)
+					{
+					boolean fail = rnd.nextDouble() < 0.02;
+
+					if (fail)
+						{
+						currentErrors++;
+						if (idx < visibleClients)
+							{
+							publish(new StatusEvent(idx, ERROR));
+							}
+						} else
+						{
+						currentDone++;
+						if (idx < visibleClients)
+							{
+							publish(new StatusEvent(idx, DONE));
+							}
+						}
+					}
+
+				currentTraining = 0;
+				publish(new SummaryEvent(currentTraining, currentDone, currentErrors));
+				publish(new LogEvent("[ROUND " + r + "] aggregation complete. errors=" + currentErrors + "\n"));
+
+				int pct = (int) Math.round((r * 100.0) / rounds);
+				publish(new ProgressEvent("Round " + r + "/" + rounds, pct));
+
+				Thread.sleep(200);
+
+				for (int idx : selected)
+					{
+					if (idx < visibleClients)
+						{
+						publish(new StatusEvent(idx, READY));
+						}
+					}
+
+				publish(new SummaryEvent(0, 0, currentErrors));
+				}
+
+			return null;
+		}
+
+		@Override
+		protected void process(List<UiEvent> chunks)
+		{
+			for (UiEvent e : chunks)
+				{
+				if (e instanceof LogEvent le)
+					{
+					append(le.msg);
+					} else if (e instanceof StatusEvent se)
+					{
+					setNodeStatus(se.row, se.st);
+					} else if (e instanceof ProgressEvent pe)
+					{
+					progress.setValue(pe.pct);
+					progress.setString(pe.label);
+					} else if (e instanceof SummaryEvent sm)
+					{
+					trainingCount = sm.training;
+					doneCount = sm.done;
+					errorCount = sm.errors;
+					refreshSummaryLabels();
+					}
+				}
+		}
+
+		@Override
+		protected void done()
+		{
+			startBtn.setEnabled(true);
+			stopBtn.setEnabled(false);
+
+			if (isCancelled())
+				{
+				progress.setValue(0);
+				progress.setString("Cancelled");
+				append("[INFO] Simulation cancelled.\n");
+				} else
+				{
+				progress.setValue(100);
+				progress.setString("Done");
+				append("[INFO] Simulation complete.\n");
+				}
+		}
+	}
+
+	private static class StatusRenderer extends DefaultTableCellRenderer
+	{
+
+		@Override
+		public Component getTableCellRendererComponent(JTable table, Object value,
+			boolean isSelected, boolean hasFocus,
+			int row, int column)
+		{
+			Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+
+			if (!isSelected)
+				{
+				String s = String.valueOf(value);
+				switch (s)
+					{
+					case "READY" ->
+						c.setBackground(new Color(220, 240, 255));
+					case "TRAINING" ->
+						c.setBackground(new Color(255, 245, 200));
+					case "DONE" ->
+						c.setBackground(new Color(215, 255, 215));
+					case "ERROR" ->
+						c.setBackground(new Color(255, 215, 215));
+					default ->
+						c.setBackground(Color.WHITE);
+					}
+				}
+
+			return c;
+		}
+	}
+
+	private void updatePartitionPreview()
+	{
+		Object selected = labelColumnCombo.getSelectedItem();
+
+		if (selected == null || csvModel.getRowCount() == 0)
+			{
+			partitionPreviewArea.setText("No dataset loaded yet.");
+			return;
+			}
+
+		String labelColumn = selected.toString();
+		int labelColIndex = csvModel.findColumn(labelColumn);
+
+		if (labelColIndex < 0)
+			{
+			partitionPreviewArea.setText("Could not find label column.");
+			return;
+			}
+
+		String benignValue = benignValueField.getText().trim();
+		String attackValue = attackValueField.getText().trim();
+		String partitionType = partitionTypeCombo.getSelectedItem().toString();
+		int clientCount = (Integer) clientPreviewSpinner.getValue();
+
+		int benignCount = 0;
+		int attackCount = 0;
+		int otherCount = 0;
+
+		for (int i = 0; i < csvModel.getRowCount(); i++)
+			{
+			Object valueObj = csvModel.getValueAt(i, labelColIndex);
+			String value = valueObj == null ? "" : valueObj.toString().trim();
+
+			if (value.equalsIgnoreCase(benignValue))
+				{
+				benignCount++;
+				} else if (value.equalsIgnoreCase(attackValue))
+				{
+				attackCount++;
+				} else
+				{
+				otherCount++;
+				}
+			}
+
+		StringBuilder sb = new StringBuilder();
+		sb.append("Partition preview\n");
+		sb.append("==============================\n");
+		sb.append("Partition type: ").append(partitionType).append("\n");
+		sb.append("Preview rows loaded: ").append(previewedRowCount).append("\n");
+		sb.append("Client preview count: ").append(clientCount).append("\n");
+		sb.append("Label column: ").append(labelColumn).append("\n");
+		sb.append("Benign value: ").append(benignValue).append("\n");
+		sb.append("Attack value: ").append(attackValue).append("\n\n");
+
+		sb.append("Class counts in preview\n");
+		sb.append("------------------------------\n");
+		sb.append("Benign rows: ").append(benignCount).append("\n");
+		sb.append("Attack rows: ").append(attackCount).append("\n");
+		sb.append("Other rows: ").append(otherCount).append("\n\n");
+
+		sb.append("Rows per client preview\n");
+                sb.append("------------------------------\n");
+                appendRowsPerClientPreview(sb, partitionType, benignCount, attackCount, otherCount, clientCount);
+
+                partitionPreviewArea.setText(sb.toString());
+                partitionPreviewArea.setCaretPosition(0);
+        }
+
+        private void appendRowsPerClientPreview(StringBuilder sb, String partitionType,
+                int benignCount, int attackCount, int otherCount,
+                int clientCount)
+        {
+                if (clientCount <= 0)
+                {
+                        sb.append("Invalid client count.\n");
+                        return;
+                }
+
+                if ("IID".equalsIgnoreCase(partitionType))
+                {
+                        int total = benignCount + attackCount + otherCount;
+                        int baseRows = total / clientCount;
+                        int remainder = total % clientCount;
+
+                        for (int i = 1; i <= clientCount; i++)
+                        {
+                                int rows = baseRows + (i <= remainder ? 1 : 0);
+                                sb.append("Client-").append(i).append(": approx ").append(rows).append(" rows\n");
+                        }
+                }
+                else
+                {
+                        int half = Math.max(1, clientCount / 2);
+
+                        for (int i = 1; i <= clientCount; i++)
+                        {
+                                if (i <= half)
+                                {
+                                        int rows = Math.max(1, benignCount / half);
+                                        sb.append("Client-").append(i)
+                                                .append(": mostly benign, approx ").append(rows).append(" rows\n");
+                                }
+                                else
+                                {
+                                        int denom = Math.max(1, clientCount - half);
+                                        int rows = Math.max(1, attackCount / denom);
+                                        sb.append("Client-").append(i)
+                                                .append(": mostly attack, approx ").append(rows).append(" rows\n");
+                                }
+                        }
+                }
+        }
+
+        private void previewSelectedLabelValues(String columnName)
+        {
+                int colIndex = csvModel.findColumn(columnName);
+
+                if (colIndex < 0)
+                {
+                        labelPreviewArea.setText("Could not find selected label column.");
+                        return;
+                }
+
+                StringBuilder sb = new StringBuilder();
+                sb.append("Selected label column: ").append(columnName).append("\n\n");
+                sb.append("Sample preview values:\n");
+
+                int rowCount = Math.min(csvModel.getRowCount(), 15);
+
+                for (int i = 0; i < rowCount; i++)
+                {
+                        Object value = csvModel.getValueAt(i, colIndex);
+                        sb.append("Row ").append(i + 1).append(": ").append(value).append("\n");
+                }
+
+                labelPreviewArea.setText(sb.toString());
+                labelPreviewArea.setCaretPosition(0);
+        }
+
+        private static final class ProgressEvent implements UiEvent
+        {
+                final String label;
+                final int pct;
+
+                ProgressEvent(String label, int pct)
+                {
+                        this.label = label;
+                        this.pct = pct;
+                }
+        }
+
+        private static final class SummaryEvent implements UiEvent
+        {
+                final int training;
+                final int done;
+                final int errors;
+
+                SummaryEvent(int training, int done, int errors)
+                {
+                        this.training = training;
+                        this.done = done;
+                        this.errors = errors;
+                }
+        }
+
+        private final class TrainingWorker extends SwingWorker<Void, UiEvent>
+        {
+                private final int clients;
+                private final int rounds;
+                private final Random rnd = new Random();
+
+                TrainingWorker(int clients, int rounds)
+                {
+                        this.clients = clients;
+                        this.rounds = rounds;
+                }
+
+                @Override
+                protected Void doInBackground() throws Exception
+                {
+                        for (int i = 0; i < visibleClients; i++)
+                        {
+                                publish(new StatusEvent(i, READY));
+                        }
+
+                        int effectiveClients = hasGeneratedPartitions()
+                                ? generatedPartitions.size()
+                                : clients;
+
+                        double sampleFraction = effectiveClients > 500 ? 0.05 : 0.25;
+
+                        for (int r = 1; r <= rounds; r++)
+                        {
+                                if (isCancelled())
+                                {
+                                        break;
+                                }
+
+                                publish(new LogEvent("[ROUND " + r + "] selecting clients...\n"));
+
+                                int k = Math.max(1, (int) Math.round(effectiveClients * sampleFraction));
+                                List<Integer> idxs = new ArrayList<>(effectiveClients);
+                                for (int i = 0; i < effectiveClients; i++)
+                                {
+                                        idxs.add(i);
+                                }
+
+                                Collections.shuffle(idxs, rnd);
+                                List<Integer> selected = idxs.subList(0, k);
+
+                                int currentTraining = selected.size();
+                                int currentDone = 0;
+                                int currentErrors = 0;
+
+                                for (int idx : selected)
+                                {
+                                        if (idx < visibleClients)
+                                        {
+                                                publish(new StatusEvent(idx, TRAINING));
+                                        }
+
+                                        String clientId = getClientIdFromIndex(idx);
+                                        int partitionSize = getPartitionSize(clientId);
+                                        String profile = describePartitionType(clientId);
+
+                                        if (hasGeneratedPartitions())
+                                        {
+                                                publish(new LogEvent(
+                                                        "[ROUND " + r + "] " + clientId
+                                                        + " training on " + partitionSize
+                                                        + " rows (" + profile + ")\n"
+                                                ));
+                                        }
+                                }
+
+                                publish(new SummaryEvent(currentTraining, currentDone, currentErrors));
+                                publish(new LogEvent("[ROUND " + r + "] local training (" + k + " clients)...\n"));
+
+                                Thread.sleep(250 + rnd.nextInt(250));
+
+                                for (int idx : selected)
+                                {
+                                        boolean fail = rnd.nextDouble() < 0.02;
+
+                                        if (fail)
+                                        {
+                                                currentErrors++;
+                                                if (idx < visibleClients)
+                                                {
+                                                        publish(new StatusEvent(idx, ERROR));
+                                                }
+                                        }
+                                        else
+                                        {
+                                                currentDone++;
+                                                if (idx < visibleClients)
+                                                {
+                                                        publish(new StatusEvent(idx, DONE));
+                                                }
+                                        }
+                                }
+
+                                currentTraining = 0;
+                                publish(new SummaryEvent(currentTraining, currentDone, currentErrors));
+                                publish(new LogEvent("[ROUND " + r + "] aggregation complete. errors=" + currentErrors + "\n"));
+
+                                int pct = (int) Math.round((r * 100.0) / rounds);
+                                publish(new ProgressEvent("Round " + r + "/" + rounds, pct));
+
+                                Thread.sleep(200);
+
+                                for (int idx : selected)
+                                {
+                                        if (idx < visibleClients)
+                                        {
+                                                publish(new StatusEvent(idx, READY));
+                                        }
+                                }
+
+                                publish(new SummaryEvent(0, 0, currentErrors));
+                        }
+
+                        return null;
+                }
+
+                @Override
+                protected void process(List<UiEvent> chunks)
+                {
+                        for (UiEvent e : chunks)
+                        {
+                                if (e instanceof LogEvent le)
+                                {
+                                        append(le.msg);
+                                }
+                                else if (e instanceof StatusEvent se)
+                                {
+                                        setNodeStatus(se.row, se.st);
+                                }
+                                else if (e instanceof ProgressEvent pe)
+                                {
+                                        progress.setValue(pe.pct);
+                                        progress.setString(pe.label);
+                                }
+                                else if (e instanceof SummaryEvent sm)
+                                {
+                                        trainingCount = sm.training;
+                                        doneCount = sm.done;
+                                        errorCount = sm.errors;
+                                        refreshSummaryLabels();
+                                }
+                        }
+                }
+
+                @Override
+                protected void done()
+                {
+                        startBtn.setEnabled(true);
+                        stopBtn.setEnabled(false);
+
+                        if (isCancelled())
+                        {
+                                progress.setValue(0);
+                                progress.setString("Cancelled");
+                                append("[INFO] Simulation cancelled.\n");
+                        }
+                        else
+                        {
+                                progress.setValue(100);
+                                progress.setString("Done");
+                                append("[INFO] Simulation complete.\n");
+                        }
+                }
+        }
+
+        private static class StatusRenderer extends DefaultTableCellRenderer
+        {
+                @Override
+                public Component getTableCellRendererComponent(JTable table, Object value,
+                        boolean isSelected, boolean hasFocus,
+                        int row, int column)
+                {
+                        Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+
+                        if (!isSelected)
+                        {
+                                String s = String.valueOf(value);
+                                switch (s)
+                                {
+                                        case "READY" ->
+                                                c.setBackground(new Color(220, 240, 255));
+                                        case "TRAINING" ->
+                                                c.setBackground(new Color(255, 245, 200));
+                                        case "DONE" ->
+                                                c.setBackground(new Color(215, 255, 215));
+                                        case "ERROR" ->
+                                                c.setBackground(new Color(255, 215, 215));
+                                        default ->
+                                                c.setBackground(Color.WHITE);
+                                }
+                        }
+
+                        return c;
+                }
+        }
+}

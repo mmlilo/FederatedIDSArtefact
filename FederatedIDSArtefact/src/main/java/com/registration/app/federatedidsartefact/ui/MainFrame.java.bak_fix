@@ -1,0 +1,284 @@
+package com.registration.app.federatedidsartefact.ui;
+
+import javax.swing.*;
+import javax.swing.table.DefaultTableCellRenderer;
+import javax.swing.table.DefaultTableModel;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
+
+public class MainFrame extends JFrame {
+
+    private static final int MAX_UI_NODES = 2000;
+
+    private static final String READY = "READY";
+    private static final String TRAINING = "TRAINING";
+    private static final String DONE = "DONE";
+    private static final String ERROR = "ERROR";
+
+    private final JTextArea log = new JTextArea();
+    private final JProgressBar progress = new JProgressBar(0, 100);
+
+    private final JTextField clientsField = new JTextField("30");
+    private final JTextField roundsField  = new JTextField("15");
+
+    private JButton startBtn;
+    private JButton stopBtn;
+
+    private final DefaultTableModel nodesModel =
+            new DefaultTableModel(new Object[]{"Node", "Status"}, 0) {
+                @Override public boolean isCellEditable(int r, int c) { return false; }
+            };
+    private final JTable nodesTable = new JTable(nodesModel);
+
+    private TrainingWorker worker;
+
+    public MainFrame() {
+        super("Federated IDS Demonstrator (Swing)");
+        setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+        setSize(1100, 700);
+        setLocationRelativeTo(null);
+
+        setLayout(new BorderLayout());
+        add(buildTopControls(), BorderLayout.NORTH);
+        add(buildTabs(), BorderLayout.CENTER);
+        add(buildStatusBar(), BorderLayout.SOUTH);
+
+        log.setEditable(false);
+        log.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+    }
+
+    private JComponent buildTopControls() {
+        JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT));
+
+        startBtn = new JButton("Start");
+        stopBtn  = new JButton("Stop");
+        stopBtn.setEnabled(false);
+
+        clientsField.setColumns(10);
+        roundsField.setColumns(6);
+
+        startBtn.addActionListener(e -> startSimulation());
+        stopBtn.addActionListener(e -> stopSimulation());
+
+        p.add(new JLabel("Clients:"));
+        p.add(clientsField);
+        p.add(new JLabel("Rounds:"));
+        p.add(roundsField);
+        p.add(startBtn);
+        p.add(stopBtn);
+
+        return p;
+    }
+
+    private JComponent buildTabs() {
+        JTabbedPane tabs = new JTabbedPane();
+
+        tabs.addTab("Data", placeholder("Step 3: Start/Stop simulation.\nNext: CSV chooser + preview."));
+        tabs.addTab("Nodes", buildNodesTab());
+        tabs.addTab("Training Log", new JScrollPane(log));
+        tabs.addTab("Results", placeholder("Next: metrics per round (Accuracy/F1/Drift)."));
+
+        return tabs;
+    }
+
+    private JComponent buildNodesTab() {
+        JPanel root = new JPanel(new BorderLayout(8, 8));
+
+        nodesTable.setFillsViewportHeight(true);
+        nodesTable.getColumnModel().getColumn(1).setCellRenderer(new StatusRenderer());
+
+        JButton apply = new JButton("Apply Clients → Nodes Table");
+        apply.addActionListener(e -> populateNodes(clampUiNodes(parseIntSafe(clientsField.getText(), 30))));
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        top.add(new JLabel("UI shows up to " + MAX_UI_NODES + " nodes to prevent freezing."));
+        top.add(apply);
+
+        root.add(top, BorderLayout.NORTH);
+        root.add(new JScrollPane(nodesTable), BorderLayout.CENTER);
+
+        populateNodes(clampUiNodes(parseIntSafe(clientsField.getText(), 30)));
+        return root;
+    }
+
+    private JComponent buildStatusBar() {
+        JPanel p = new JPanel(new BorderLayout());
+        progress.setStringPainted(true);
+        progress.setValue(0);
+        progress.setString("Idle");
+        p.add(progress, BorderLayout.CENTER);
+        return p;
+    }
+
+    private JComponent placeholder(String msg) {
+        JTextArea a = new JTextArea(msg);
+        a.setEditable(false);
+        a.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+        a.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
+        return new JScrollPane(a);
+    }
+
+    private void startSimulation() {
+        if (worker != null && !worker.isDone()) {
+            append("[WARN] Already running.\n");
+            return;
+        }
+
+        int requestedClients = parseIntSafe(clientsField.getText(), 30);
+        int shownClients = clampUiNodes(requestedClients);
+        int rounds = Math.max(1, parseIntSafe(roundsField.getText(), 15));
+
+        populateNodes(shownClients);
+
+        append("[INFO] Starting simulation...\n");
+        append("[INFO] Requested clients: " + requestedClients + "\n");
+        if (requestedClients != shownClients) {
+            append("[WARN] UI displaying " + shownClients + " clients (capped).\n");
+        }
+        append("[INFO] Rounds: " + rounds + "\n");
+
+        startBtn.setEnabled(false);
+        stopBtn.setEnabled(true);
+        progress.setValue(0);
+        progress.setString("Running...");
+
+        worker = new TrainingWorker(shownClients, rounds);
+        worker.execute();
+    }
+
+    private void stopSimulation() {
+        if (worker != null && !worker.isDone()) {
+            worker.cancel(true);
+            append("[INFO] Stop requested.\n");
+        }
+    }
+
+    private void populateNodes(int n) {
+        nodesModel.setRowCount(0);
+        for (int i = 1; i <= n; i++) {
+            nodesModel.addRow(new Object[]{"Client-" + i, READY});
+        }
+    }
+
+    private void setNodeStatus(int row, String status) {
+        if (row >= 0 && row < nodesModel.getRowCount()) {
+            nodesModel.setValueAt(status, row, 1);
+        }
+    }
+
+    private int clampUiNodes(int requested) {
+        if (requested > MAX_UI_NODES) return MAX_UI_NODES;
+        return Math.max(1, requested);
+    }
+
+    private void append(String s) {
+        log.append(s);
+        log.setCaretPosition(log.getDocument().getLength());
+    }
+
+    private static int parseIntSafe(String s, int fallback) {
+        try { return Integer.parseInt(s.trim().replace(",", "")); }
+        catch (Exception ex) { return fallback; }
+    }
+
+    private interface UiEvent {}
+    private static final class LogEvent implements UiEvent { final String msg; LogEvent(String m){msg=m;} }
+    private static final class StatusEvent implements UiEvent { final int row; final String st; StatusEvent(int r,String s){row=r;st=s;} }
+    private static final class ProgressEvent implements UiEvent { final int pct; final String label; ProgressEvent(int p,String l){pct=p;label=l;} }
+
+    private final class TrainingWorker extends SwingWorker<Void, UiEvent> {
+        private final int clients;
+        private final int rounds;
+        private final Random rnd = new Random();
+
+        TrainingWorker(int clients, int rounds) {
+            this.clients = clients;
+            this.rounds = rounds;
+        }
+
+        @Override protected Void doInBackground() throws Exception {
+            for (int i = 0; i < clients; i++) publish(new StatusEvent(i, READY));
+
+            double sampleFraction = 0.25;
+
+            for (int r = 1; r <= rounds; r++) {
+                if (isCancelled()) break;
+
+                publish(new LogEvent("[ROUND " + r + "] selecting clients...\n"));
+
+                int k = Math.max(1, (int) Math.round(clients * sampleFraction));
+                List<Integer> idxs = new ArrayList<>(clients);
+                for (int i = 0; i < clients; i++) idxs.add(i);
+                Collections.shuffle(idxs, rnd);
+                List<Integer> selected = idxs.subList(0, k);
+
+                for (int idx : selected) publish(new StatusEvent(idx, TRAINING));
+
+                publish(new LogEvent("[ROUND " + r + "] local training (" + k + " clients)...\n"));
+                Thread.sleep(250 + rnd.nextInt(250));
+
+                int errors = 0;
+                for (int idx : selected) {
+                    boolean fail = rnd.nextDouble() < 0.02;
+                    if (fail) { errors++; publish(new StatusEvent(idx, ERROR)); }
+                    else publish(new StatusEvent(idx, DONE));
+                }
+
+                publish(new LogEvent("[ROUND " + r + "] aggregation complete. errors=" + errors + "\n"));
+
+                int pct = (int) Math.round((r * 100.0) / rounds);
+                publish(new ProgressEvent("Round " + r + "/" + rounds, pct));
+
+                Thread.sleep(200);
+                for (int idx : selected) publish(new StatusEvent(idx, READY));
+            }
+            return null;
+        }
+
+        @Override protected void process(List<UiEvent> chunks) {
+            for (UiEvent e : chunks) {
+                if (e instanceof LogEvent le) append(le.msg);
+                else if (e instanceof StatusEvent se) setNodeStatus(se.row, se.st);
+                else if (e instanceof ProgressEvent pe) { progress.setValue(pe.pct); progress.setString(pe.label); }
+            }
+        }
+
+        @Override protected void done() {
+            startBtn.setEnabled(true);
+            stopBtn.setEnabled(false);
+
+            if (isCancelled()) {
+                progress.setValue(0);
+                progress.setString("Cancelled");
+                append("[INFO] Simulation cancelled.\n");
+            } else {
+                progress.setValue(100);
+                progress.setString("Done");
+                append("[INFO] Simulation complete.\n");
+            }
+        }
+    }
+
+    private static class StatusRenderer extends DefaultTableCellRenderer {
+        @Override
+        public Component getTableCellRendererComponent(JTable table, Object value,
+                                                       boolean isSelected, boolean hasFocus,
+                                                       int row, int column) {
+            Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+            if (!isSelected) {
+                String s = String.valueOf(value);
+                switch (s) {
+                    case READY -> c.setBackground(new Color(220, 240, 255));
+                    case TRAINING -> c.setBackground(new Color(255, 245, 200));
+                    case DONE -> c.setBackground(new Color(215, 255, 215));
+                    case ERROR -> c.setBackground(new Color(255, 215, 215));
+                    default -> c.setBackground(Color.WHITE);
+                }
+            }
+            return c;
+        }
+    }
+}
